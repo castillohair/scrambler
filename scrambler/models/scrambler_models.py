@@ -79,6 +79,15 @@ class InstanceNormalization(Layer):
     def call(self, inputs):
         mean, variance = tf.nn.moments(inputs, self.axes, keepdims=True)
         return tf.nn.batch_normalization(inputs, mean, variance, self.beta, self.gamma, 1e-6)
+    
+    #TODO: overrise the get config method to update to tf2 and new keras support 
+    #see this discussion (https://stackoverflow.com/questions/58678836/notimplementederror-layers-with-arguments-in-init-must-override-get-conf) 
+    def get_config(self):
+        config = super().get_config().copy()
+        config.update({
+            'axes': self.axes,
+            'trainable': self.trainable})
+        return config
 
 #Stochastic Binarized Neuron helper functions (Tensorflow)
 #ST Estimator code adopted from https://r2rt.com/beyond-binary-ternary-and-one-hot-neurons.html
