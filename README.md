@@ -3,6 +3,9 @@
 ![Scrambler Logo](https://github.com/johli/scrambler/blob/master/resources/scrambler_logo.png?raw=true)
 
 # Scrambler Neural Networks
+
+AML: udpating to tf 2 compatability & latest keras release (note that new keras release means you need to use the forked isolearn repo being updated to latest keras release at lafleur1/isolearn)
+
 Code for training Scrambler networks, an interpretation method for sequence-predictive models based on deep generative masking. The Scrambler learns to predict maximal-entropy PSSMs for a given input sequence such that downstream predictions are reconstructed (the "inclusion" objective). Alternatively, the Scrambler can be trained to output minimal-entropy PSSMs such that downstream predictions are distorted (the "occlusion" objective).
 
 Scramblers were presented in a MLCB 2020* conference paper, "[Efficient inference of nonlinear feature attributions with Scrambling Neural Networks](https://drive.google.com/file/d/142tmyEMLUSsV-IEkN-NFcEUd7-LFwaAF/view?usp=sharing)".
