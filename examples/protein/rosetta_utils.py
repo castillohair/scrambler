@@ -1,29 +1,18 @@
-import keras
-
-from keras.models import Sequential, Model, load_model
-from keras.layers import Dense, Dropout, Activation, Flatten, Input, Lambda
-from keras.layers import Conv2D, MaxPooling2D, BatchNormalization, Concatenate, Reshape, Softmax
-
-from keras import backend as K
-
-import keras.losses
-
-import os
-
-import pickle
+from tensorflow.keras.models import Sequential, Model, load_model
+from tensorflow.keras.layers import Dense, Dropout, Activation, Flatten, Input, Lambda
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, BatchNormalization, Concatenate, Reshape, Softmax
+import tensorflow.keras.backend as K
 import numpy as np
-from sklearn import preprocessing
-import pandas as pd
 
-import matplotlib.pyplot as plt
+import tensorflow as tf
+
 import string
-
-import keras.backend as K
-#from keras.legacy import interfaces
+#from tensorflow.keras.legacy import interfaces
 from keras.optimizers import Optimizer
+from keras.layers import Layer, InputSpec
 
+from tensorflow.keras import initializers, regularizers, constraints
 from scrambler.models import *
-
 
 def one_hot_encode_msa(msa, ns=21):
     one_hot = np.zeros((msa.shape[0], msa.shape[1], ns))
@@ -32,7 +21,6 @@ def one_hot_encode_msa(msa, ns=21):
             one_hot[i, j, int(msa[i, j])] = 1.
 
     return one_hot
-
 
 def parse_a3m(filename):
     seqs = []
@@ -160,10 +148,6 @@ class AdamAccumulate(Optimizer):
                   'amsgrad': self.amsgrad}
         base_config = super(AdamAccumulate, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
-
-
-from keras.layers import Layer, InputSpec
-from keras import initializers, regularizers, constraints
 
 
 class LegacyInstanceNormalization(Layer):
