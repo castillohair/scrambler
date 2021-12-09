@@ -1,4 +1,5 @@
 import keras
+import tensorflow as tf #recommended to import keras this way now for optimizer access 
 
 from keras.models import Sequential, Model, load_model
 from keras.layers import Dense, Dropout, Activation, Flatten, Input, Lambda
@@ -117,7 +118,7 @@ def load_optimus5_predictor(predictor_path) :
     )
 
     predictor.trainable = False
-    predictor.compile(optimizer=keras.optimizers.SGD(lr=0.1), loss='mean_squared_error')
+    predictor.compile(optimizer=tf.keras.optimizers.SGD(learning_rate=0.1), loss='mean_squared_error')
 
     return predictor
 
