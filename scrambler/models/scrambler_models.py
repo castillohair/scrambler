@@ -1869,7 +1869,7 @@ class Scrambler:
 
         # (Re-)Initialize scrambler mask
         def _reset_generator(scrambler_model, verbose=False):
-            session = K.get_session()
+            session = tf1.keras.backend.get_session()
             for layer in scrambler_model.layers:
                 if 'scrambler' in layer.name:
                     for v in layer.__dict__:
@@ -1882,7 +1882,7 @@ class Scrambler:
 
         # (Re-)Initialize Optimizer
         def _reset_optimizer(opt, verbose=False):
-            session = K.get_session()
+            session = tf1.keras.backend.get_session()
             for v in opt.__dict__:
                 v_arg = getattr(opt, v)
                 if hasattr(v_arg, 'initializer'):
