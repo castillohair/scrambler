@@ -672,47 +672,238 @@ def get_sigmoid_min_nll():
 
     return _min_nll
 
+class MovingEntropyCallback(Callback):
+    """
+    Callback for updating entropy loss layer
 
-def get_margin_entropy_ame_masked(x_start, x_end, y_start, y_end, max_bits=1.0):
-    def _margin_entropy_ame_masked(pwm, pwm_mask, pwm_background):
-        conservation = pwm[:, x_start:x_end, y_start:y_end, :] * K.log(
-            K.clip(pwm[:, x_start:x_end, y_start:y_end, :], K.epsilon(), 1. - K.epsilon()) / pwm_background[:,
-                                                                                             x_start:x_end,
-                                                                                             y_start:y_end, :]) / K.log(
-            2.0)
+    Computes a new entropy target every batch or epoch, from `bits_start` to `bits_end` at
+    a rate of `bits_rate`. The entropy target is kept constant after `bits_end` is reached.
+    The new entropy target is loaded as the weight of `entropy_loss_layer`.
+    
+    Parameters
+    ----------
+    entropy_loss_layer: Keras Layer
+        Layer to be updated
+    bits_start, bits_end: float
+        The initial and final target entropy values
+    bits_rate: float
+        The rate at which to change the target entropy, in bits/batch or bits/epoch
+        depending on `mode`.
+    mode: {'epoch', 'batch'}
+        Whether to update the target entropy every epoch or batch.
+
+    """
+
+    def __init__(self, entropy_loss_layer, bits_start=2.0, bits_end=0.125, bits_rate=0.05, mode='batch'):
+        super().__init__()
+
+        self.entropy_loss_layer = entropy_loss_layer
+        self.bits_start = bits_start
+        self.bits_end = bits_end
+        self.bits_rate = bits_rate
+        self.mode = mode
+
+        self.total_batch = 0
+
+        self.update_target_bits(0)
+        # print("moving entropy callback init")
+
+    def update_target_bits(self, period):
+        # Compute new entropy bits value
+        if self.bits_end > self.bits_start:
+            self.target_bits = self.bits_start + period*self.bits_rate
+            if self.target_bits > self.bits_end:
+                self.target_bits = self.bits_end
+            
+        else:
+            self.target_bits = self.bits_start - period*self.bits_rate
+            if self.target_bits < self.bits_end:
+                self.target_bits = self.bits_end
+        
+        # print(f"target bits: {self.target_bits}")
+
+        # Update layer weight
+        self.entropy_loss_layer.set_weights([np.array([self.target_bits])])
+
+        # print(f"entropy loss layer weights: {self.entropy_loss_layer.get_weights()}")
+
+    def on_train_batch_end(self, batch, logs=None):
+        # print("moving entropy callback batch end")
+        if self.mode=='batch':
+            self.update_target_bits(batch)
+        elif self.mode=='total_batch':
+            self.total_batch += 1
+            self.update_target_bits(self.total_batch)
+
+    def on_epoch_end(self, epoch, logs=None):
+        # print("moving entropy callback epoch end")
+        # print(f"epoch {epoch}")
+        if self.mode=='epoch' and epoch > 0:
+            self.update_target_bits(epoch)
+
+
+class EntropyLossLayer(Layer):
+    """
+    Layer that computes a quadratic or margin entropy loss for a given pwm and background.
+
+    Can generate a `MovingEntropyCallback` to update the entropy target every epoch or batch.
+
+    Parameters
+    ----------
+    entropy_mode: {'target', 'maximization', 'minimization'}
+        Whether to use a quadratic (`target`) or margin (`maximization`, `minimization`)
+        loss function.
+    x_start, x_end, y_start, y_end: float
+        Initial and final positions to use from input pwms
+    target_bits: float
+        Target or margin entropy bits value. Ignored if `moving_mode` is specified.
+    moving_bits_mode: {None, 'batch', 'epoch', 'total_batch'}
+        Whether to update the target bits value every batch or epoch.
+    moving_bits_start, moving_bits_end: float
+        The initial and final target entropy values when `moving_bits_mode` is specified.
+    moving_bits_rate: float
+        The rate at which to change the target entropy, in bits/batch or bits/epoch
+        depending on `moving_bits_mode`.
+    
+    """
+
+    def __init__(
+            self,
+            mode,
+            x_start,
+            x_end,
+            y_start,
+            y_end,
+            target_bits=None,
+            moving_bits_mode=None,
+            moving_bits_start=None,
+            moving_bits_end=None,
+            moving_bits_rate=None,
+            name=None,
+            **kwargs,
+        ):
+
+        super(EntropyLossLayer, self).__init__(name=name, **kwargs)
+
+        self.mode = mode
+        self.x_start = x_start
+        self.x_end = x_end
+        self.y_start = y_start
+        self.y_end = y_end
+
+        # Set entropy bits as a non-trainable weight
+        self.target_bits = self.add_weight(
+            shape=(1,),
+            trainable=False,
+            name='target_bits',
+        )
+        # Set loss function
+        if mode=='maximization':
+            self.entropy_loss_func = self._margin_max_entropy_ame_masked
+        elif mode=='minimization':
+            self.entropy_loss_func = self._margin_min_entropy_ame_masked
+        elif mode=='target':
+            self.entropy_loss_func = self._target_entropy_sme_masked
+        else:
+            raise ValueError(f"entropy mode {mode} not recognized.")
+        # Set initial weight and callback object depending on the entropy mode
+        if moving_bits_mode=='batch' or moving_bits_mode=='total_batch' or moving_bits_mode=='epoch':
+            self.callback=MovingEntropyCallback(
+                entropy_loss_layer=self,
+                bits_start=moving_bits_start,
+                bits_end=moving_bits_end,
+                bits_rate=moving_bits_rate,
+                mode=moving_bits_mode,
+            )
+        else:
+            self.set_weights([np.array([target_bits])])
+            self.callback=None
+
+    def _margin_max_entropy_ame_masked(self, pwm, pwm_mask, pwm_background):
+        conservation = \
+            pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :] * \
+            K.log(
+                K.clip(
+                    pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :],
+                    K.epsilon(),
+                    1. - K.epsilon(),
+                ) / \
+                pwm_background[:, self.x_start:self.x_end, self.y_start:self.y_end, :]
+            ) / \
+            K.log(2.0)
         conservation = K.sum(conservation, axis=-1)
 
-        mask = K.max(pwm_mask[:, x_start:x_end, y_start:y_end, :], axis=-1)
+        mask = K.max(pwm_mask[:, self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
         n_unmasked = K.sum(mask, axis=(1, 2))
 
         mean_conservation = K.sum(conservation * mask, axis=(1, 2)) / n_unmasked
 
-        margin_conservation = K.switch(mean_conservation > K.constant(max_bits, shape=(1,)),
-                                       mean_conservation - K.constant(max_bits, shape=(1,)),
-                                       K.zeros_like(mean_conservation))
+        margin_conservation = K.switch(
+            mean_conservation > self.target_bits,
+            mean_conservation - self.target_bits,
+            K.zeros_like(mean_conservation),
+        )
 
         return margin_conservation
 
-    return _margin_entropy_ame_masked
-
-
-def get_target_entropy_sme_masked(x_start, x_end, y_start, y_end, target_bits=1.0):
-    def _target_entropy_sme_masked(pwm, pwm_mask, pwm_background):
-        conservation = pwm[:, x_start:x_end, y_start:y_end, :] * K.log(
-            K.clip(pwm[:, x_start:x_end, y_start:y_end, :], K.epsilon(), 1. - K.epsilon()) / pwm_background[:,
-                                                                                             x_start:x_end,
-                                                                                             y_start:y_end, :]) / K.log(
-            2.0)
+    def _margin_min_entropy_ame_masked(self, pwm, pwm_mask, pwm_background):
+        conservation = \
+            pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :] * \
+            K.log(
+                K.clip(
+                    pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :],
+                    K.epsilon(),
+                    1. - K.epsilon(),
+                ) / \
+                pwm_background[:, self.x_start:self.x_end, self.y_start:self.y_end, :]
+            ) / \
+            K.log(2.0)
         conservation = K.sum(conservation, axis=-1)
 
-        mask = K.max(pwm_mask[:, x_start:x_end, y_start:y_end, :], axis=-1)
+        mask = K.max(pwm_mask[:, self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
         n_unmasked = K.sum(mask, axis=(1, 2))
 
         mean_conservation = K.sum(conservation * mask, axis=(1, 2)) / n_unmasked
 
-        return (mean_conservation - target_bits) ** 2
+        margin_conservation = K.switch(
+            mean_conservation < self.target_bits,
+            self.target_bits - mean_conservation,
+            K.zeros_like(mean_conservation),
+        )
 
-    return _target_entropy_sme_masked
+        return margin_conservation
+
+    def _target_entropy_sme_masked(self, pwm, pwm_mask, pwm_background):
+        conservation = \
+            pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :] * \
+            K.log(
+                K.clip(
+                    pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :],
+                    K.epsilon(),
+                    1. - K.epsilon(),
+                ) / \
+                pwm_background[:, self.x_start:self.x_end, self.y_start:self.y_end, :]
+            ) / \
+            K.log(2.0)
+        conservation = K.sum(conservation, axis=-1)
+
+        mask = K.max(pwm_mask[:, self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
+        n_unmasked = K.sum(mask, axis=(1, 2))
+
+        mean_conservation = K.sum(conservation * mask, axis=(1, 2)) / n_unmasked
+
+        return (mean_conservation - self.target_bits) ** 2
+
+    def call(self, inputs, mask=None):
+
+        pwm, pwm_mask, pwm_background = inputs
+
+        loss = K.expand_dims(
+            self.entropy_loss_func(pwm, pwm_mask, pwm_background),
+            axis=-1,
+        )
+
+        return loss
 
 
 def get_weighted_loss(loss_coeff=1.):
@@ -1100,7 +1291,8 @@ class Scrambler:
               extra_input_test=None, group_train=None, group_test=None, monitor_test_indices=None,
               monitor_batch_freq_dict={0: 1, 1: 5, 5: 10}, adam_lr=0.0001, adam_beta_1=0.5, adam_beta_2=0.9,
               nll_mode='reconstruction', predictor_task='classification', custom_loss_func=None, reference='predictor',
-              entropy_mode='target', entropy_bits=0., entropy_weight=1.):
+              entropy_mode='target', entropy_bits=0., entropy_weight=1.,
+              entropy_moving_bits_mode=None, entropy_bits_start=2., entropy_bits_end=0.125, entropy_bits_rate=0.01):
 
         if not isinstance(x_train, list):
             x_train = [x_train]
@@ -1322,14 +1514,6 @@ class Scrambler:
             elif nll_mode == 'minimization' and predictor_task == 'regression':
                 nll_loss_func = get_linear_min_nll()
 
-        # Entropy cost
-        entropy_loss_func = None
-        if entropy_mode == 'target':
-            entropy_loss_func = get_target_entropy_sme_masked(x_start=0, x_end=self.input_size_x, y_start=0,
-                                                              y_end=self.input_size_y, target_bits=entropy_bits)
-        elif entropy_mode == 'maximization':
-            entropy_loss_func = get_margin_entropy_ame_masked(x_start=0, x_end=self.input_size_x, y_start=0,
-                                                              y_end=self.input_size_y, max_bits=entropy_bits)
 
         # Execute NLL cost
         nll_loss = Lambda(lambda x: scrambler_mode_coeff * nll_loss_func(x[0], x[1]), name='nll')([
@@ -1339,14 +1523,29 @@ class Scrambler:
 
         # Execute entropy cost
         entropy_losses = []
+        entropy_update_callbacks = []
         for input_ix in range(self.n_inputs):
-            entropy_loss = Lambda(lambda x: K.expand_dims(entropy_loss_func(x[0], x[1], x[2]), axis=-1),
-                                  name='entropy_' + str(input_ix))([
+            entropy_loss_layer = EntropyLossLayer(
+                mode=entropy_mode,
+                x_start=0,
+                x_end=self.input_size_x,
+                y_start=0,
+                y_end=self.input_size_y,
+                target_bits=entropy_bits,
+                moving_bits_mode=entropy_moving_bits_mode,
+                moving_bits_start=entropy_bits_start,
+                moving_bits_end=entropy_bits_end,
+                moving_bits_rate=entropy_bits_rate,
+                name='entropy_' + str(input_ix),
+            )
+            entropy_loss = entropy_loss_layer([
                 pwms[input_ix],
                 pwm_masks[input_ix],
                 x_means[input_ix]
             ])
             entropy_losses.append(entropy_loss)
+            if entropy_loss_layer.callback is not None:
+                entropy_update_callbacks.append(entropy_loss_layer.callback)
 
         entropy_loss = None
         if len(entropy_losses) > 1:
@@ -1378,6 +1577,7 @@ class Scrambler:
 
         # Execute training procedure
         callbacks = []
+        callbacks += entropy_update_callbacks
 
         dummy_train = np.zeros((x_train[0].shape[0], 1))
         dummy_test = np.zeros((x_test[0].shape[0], 1))
