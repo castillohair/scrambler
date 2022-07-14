@@ -111,24 +111,26 @@ def mask_pwm(inputs):
 
 def sample_pwm_st(pwm_logits, n_channels=4, temperature=None):
     n_examples = K.shape(pwm_logits)[0]
-    input_size_x = K.shape(pwm_logits)[1]
-    input_size_y = K.shape(pwm_logits)[2]
+    n_outputs = K.shape(pwm_logits)[1]
+    input_size_x = K.shape(pwm_logits)[2]
+    input_size_y = K.shape(pwm_logits)[3]
 
-    flat_pwm = K.reshape(pwm_logits, (n_examples * input_size_x * input_size_y, n_channels))
+    flat_pwm = K.reshape(pwm_logits, (n_examples * n_outputs * input_size_x * input_size_y, n_channels))
     sampled_pwm = st_sampled_softmax(flat_pwm)
 
-    return K.reshape(sampled_pwm, (n_examples, input_size_x, input_size_y, n_channels))
+    return K.reshape(sampled_pwm, (n_examples, n_outputs, input_size_x, input_size_y, n_channels))
 
 
 def sample_pwm_gumbel(pwm_logits, n_channels=4, temperature=0.5):
     n_examples = K.shape(pwm_logits)[0]
-    input_size_x = K.shape(pwm_logits)[1]
-    input_size_y = K.shape(pwm_logits)[2]
+    n_outputs = K.shape(pwm_logits)[1]
+    input_size_x = K.shape(pwm_logits)[2]
+    input_size_y = K.shape(pwm_logits)[3]
 
-    flat_pwm = K.reshape(pwm_logits, (n_examples * input_size_x * input_size_y, n_channels))
+    flat_pwm = K.reshape(pwm_logits, (n_examples * n_outputs * input_size_x * input_size_y, n_channels))
     sampled_pwm = gumbel_softmax(flat_pwm, temperature=temperature)
 
-    return K.reshape(sampled_pwm, (n_examples, input_size_x, input_size_y, n_channels))
+    return K.reshape(sampled_pwm, (n_examples, n_outputs, input_size_x, input_size_y, n_channels))
 
 
 # Generator helper functions
@@ -176,9 +178,9 @@ def initialize_templates(model, template_matrices, background_matrices, model_pr
 
 # Generator construction function
 def build_sampler(batch_size, input_size_x, input_size_y, n_classes=1, n_samples=1, sample_mode='st', n_channels=4,
-                  gumbel_temp=0.5, model_prefix=''):
+                  n_outputs=1, gumbel_temp=0.5, model_prefix=''):
     # Initialize Reshape layer
-    reshape_layer = Reshape((input_size_x, input_size_y, n_channels))
+    reshape_layer = Reshape((1, input_size_x, input_size_y, n_channels))
 
     # Initialize background matrix
     onehot_background_dense = Embedding(n_classes, input_size_x * input_size_y * n_channels,
@@ -191,8 +193,7 @@ def build_sampler(batch_size, input_size_x, input_size_y, n_classes=1, n_samples
                                   name=model_prefix + 'mask_dense')
 
     # Initialize Templating and Masking Lambda layer
-    masking_layer = Lambda(mask_pwm, output_shape=(input_size_x, input_size_y, n_channels),
-                           name=model_prefix + 'masking_layer')
+    masking_layer = Lambda(mask_pwm, name=model_prefix + 'masking_layer')
     background_layer = Lambda(lambda x: x[0] + x[1], name=model_prefix + 'background_layer')
 
     # Initialize PWM normalization layer
@@ -205,12 +206,33 @@ def build_sampler(batch_size, input_size_x, input_size_y, n_classes=1, n_samples
     elif sample_mode == 'gumbel':
         sample_func = sample_pwm_gumbel
 
-    upsampling_layer = Lambda(lambda x: K.tile(x, [n_samples, 1, 1, 1]), name=model_prefix + 'upsampling_layer')
-    sampling_layer = Lambda(lambda x: sample_func(x, n_channels=n_channels, temperature=gumbel_temp),
-                            name=model_prefix + 'pwm_sampler')
+    upsampling_layer = Lambda(
+        lambda x: K.tile(x, [n_samples, 1, 1, 1, 1]),
+        name=model_prefix + 'upsampling_layer',
+    )
+    sampling_layer = Lambda(
+        lambda x: sample_func(x, n_channels=n_channels, temperature=gumbel_temp),
+        name=model_prefix + 'pwm_sampler',
+    )
     permute_layer = Lambda(
-        lambda x: K.permute_dimensions(K.reshape(x, (n_samples, batch_size, input_size_x, input_size_y, n_channels)),
-                                       (1, 0, 2, 3, 4)), name=model_prefix + 'permute_layer')
+        lambda x: K.permute_dimensions(
+            K.reshape(x, (n_samples, batch_size, n_outputs, input_size_x, input_size_y, n_channels)),
+            (1, 0, 2, 3, 4, 5),
+        ),
+        name=model_prefix + 'permute_layer',
+    )
+
+    upsampling_masking_layer = Lambda(
+        lambda x: K.tile(x, [n_samples*n_outputs, 1, 1, 1, 1]),
+        name=model_prefix + 'upsampling_masking_layer',
+    )
+    permute_masking_layer = Lambda(
+        lambda x: K.permute_dimensions(
+            K.reshape(x, (n_samples, n_outputs, batch_size, input_size_x, input_size_y, n_channels)),
+            (2, 0, 1, 3, 4, 5),
+        ),
+        name=model_prefix + 'permute_masking_layer',
+    )
 
     def _sampler_func(class_input, raw_logits):
 
@@ -230,7 +252,7 @@ def build_sampler(batch_size, input_size_x, input_size_y, n_classes=1, n_samples
         sampled_pwm = sampling_layer(pwm_logits_upsampled)
         sampled_pwm = permute_layer(sampled_pwm)
 
-        sampled_mask = permute_layer(upsampling_layer(onehot_mask))
+        sampled_mask = permute_masking_layer(upsampling_masking_layer(onehot_mask))
 
         return pwm_logits, pwm, sampled_pwm, onehot_mask, sampled_mask
 
@@ -349,7 +371,7 @@ def mask_dropout_single_scale(mask, n_spatial_dims=1, drop_scale=1, min_drop_rat
     return K.switch(K.learning_phase(), ret_mask, mask)
 
 
-def load_scrambler_network(input_size_x, input_size_y, scrambler_mode='inclusion', n_out_channels=4, n_spatial_dims=1,
+def load_scrambler_network(input_size_x, input_size_y, scrambler_mode='inclusion', n_out_channels=4, n_outputs=1, n_spatial_dims=1,
                            n_groups=1, n_resblocks_per_group=4, n_channels=32, window_size=8, mask_smoothing=False,
                            smooth_window_size=None, dilation_rates=[1], drop_rate=0.0, norm_mode='instance',
                            mask_dropout=False, mask_drop_scales=[1, 5], mask_min_drop_rate=0.0, mask_max_drop_rate=0.5,
@@ -405,21 +427,54 @@ def load_scrambler_network(input_size_x, input_size_y, scrambler_mode='inclusion
 
     skip_add = Lambda(lambda x: x[0] + x[1], name='scrambler_skip_add')
 
-    final_conv = Conv2D(1, (1, 1), strides=(1, 1), padding='same', activation='softplus',
+    final_conv = Conv2D(n_outputs, (1, 1), strides=(1, 1), padding='same', activation='linear',
                         kernel_initializer='glorot_normal', name='scrambler_final_conv')
+    # The output here is (n_seqs, input_size_x, input_size_y, n_outputs).
+    # Adjust dimensions to (n_seqs, n_outputs, input_size_x, input_size_y, 1)
+    final_conv_adjust_dim = Lambda(
+        lambda x: K.permute_dimensions(
+            K.expand_dims(x, axis=1),
+            (0, 4, 2, 3, 1),
+        ),
+        name='scrambler_final_conv_adjust_dim',
+    )
+    # Separate softplus layer
+    final_softplus = Lambda(lambda x: K.softplus(x), name='scrambler_final_softplus')
 
     smooth_conv = None
     if mask_smoothing:
-        smooth_conv = Conv2D(1, (1, smooth_window_size) if n_spatial_dims == 1 else (
-        smooth_window_size, smooth_window_size), strides=(1, 1), use_bias=False, padding='same', activation='linear',
-                             kernel_initializer='ones', name='scrambler_smooth_conv')
+        smooth_reshape_in = Lambda(
+            lambda x: K.reshape(x, (x.shape[0]*n_outputs, input_size_x, input_size_y, 1))
+        )
+        smooth_conv = Conv2D(
+            1,
+            (1, smooth_window_size) if n_spatial_dims == 1 else (smooth_window_size, smooth_window_size),
+            strides=(1, 1),
+            use_bias=False,
+            padding='same',
+            activation='linear',
+            kernel_initializer='ones',
+            name='scrambler_smooth_conv',
+        )
+        smooth_reshape_out = Lambda(
+            lambda x: K.reshape(x, (x.shape[0]/n_outputs, n_outputs, input_size_x, input_size_y, 1))
+        )
 
     onehot_to_logits = Lambda(lambda x: 2. * x - 1., name='scrambler_onehot_to_logits')
 
-    scale_logits = Lambda(lambda x: x[1] * K.tile(x[0], (1, 1, 1, n_out_channels)), name='scrambler_logit_scale')
-    if scrambler_mode == 'occlusion':
-        scale_logits = Lambda(lambda x: x[1] / K.maximum(K.tile(x[0], (1, 1, 1, n_out_channels)), K.epsilon()),
-                              name='scrambler_logit_scale')
+    # scale_logits(pssm, seq)
+    if scrambler_mode == 'inclusion':
+        scale_logits = Lambda(
+            lambda x: K.tile(K.expand_dims(x[1], axis=1), (1, n_outputs, 1, 1, 1)) *\
+                K.tile(x[0], (1, 1, 1, 1, n_out_channels)),
+            name='scrambler_logit_scale',
+        )
+    elif scrambler_mode == 'occlusion':
+        scale_logits = Lambda(
+            lambda x: K.tile(K.expand_dims(x[1], axis=1), (1, n_outputs, 1, 1, 1)) /\
+                K.maximum(K.tile(x[0], (1, 1, 1, 1, n_out_channels)), K.epsilon()),
+            name='scrambler_logit_scale',
+        )
 
     def _scrambler_func(example_input, mask_input=None, label_input=None):
 
@@ -452,15 +507,15 @@ def load_scrambler_network(input_size_x, input_size_y, scrambler_mode='inclusion
             skip_add_out = skip_add([skip_add_out, skip_conv_outs[group_ix]])
 
         # Final conv out
-        final_conv_out = final_conv(skip_add_out)
+        final_conv_out = final_softplus(final_conv_adjust_dim(final_conv(skip_add_out)))
 
         if mask_dropout:
             final_conv_out = mask_multiply([final_conv_out, mask_dropped])
 
         if mask_smoothing:
-            final_conv_out = smooth_conv(final_conv_out)
+            final_conv_out = smooth_reshape_out(smooth_conv(smooth_reshape_in(final_conv_out)))
 
-        # Scale logits by importance scores
+        # Scale input logits by importance scores
         scaled_logits = scale_logits([final_conv_out, onehot_to_logits(example_input)])
 
         return scaled_logits, final_conv_out
@@ -821,22 +876,22 @@ class EntropyLossLayer(Layer):
 
     def _margin_max_entropy_ame_masked(self, pwm, pwm_mask, pwm_background):
         conservation = \
-            pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :] * \
+            pwm[..., self.x_start:self.x_end, self.y_start:self.y_end, :] * \
             K.log(
                 K.clip(
-                    pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :],
+                    pwm[..., self.x_start:self.x_end, self.y_start:self.y_end, :],
                     K.epsilon(),
                     1. - K.epsilon(),
                 ) / \
-                pwm_background[:, self.x_start:self.x_end, self.y_start:self.y_end, :]
+                pwm_background[..., self.x_start:self.x_end, self.y_start:self.y_end, :]
             ) / \
             K.log(2.0)
         conservation = K.sum(conservation, axis=-1)
 
-        mask = K.max(pwm_mask[:, self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
-        n_unmasked = K.sum(mask, axis=(1, 2))
+        mask = K.max(pwm_mask[..., self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
+        n_unmasked = K.sum(mask, axis=(-2, -1))
 
-        mean_conservation = K.sum(conservation * mask, axis=(1, 2)) / n_unmasked
+        mean_conservation = K.sum(conservation * mask, axis=(-2, -1)) / n_unmasked
 
         margin_conservation = K.switch(
             mean_conservation > self.target_bits,
@@ -844,26 +899,26 @@ class EntropyLossLayer(Layer):
             K.zeros_like(mean_conservation),
         )
 
-        return margin_conservation
+        return K.mean(margin_conservation, axis=-1)
 
     def _margin_min_entropy_ame_masked(self, pwm, pwm_mask, pwm_background):
         conservation = \
-            pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :] * \
+            pwm[..., self.x_start:self.x_end, self.y_start:self.y_end, :] * \
             K.log(
                 K.clip(
-                    pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :],
+                    pwm[..., self.x_start:self.x_end, self.y_start:self.y_end, :],
                     K.epsilon(),
                     1. - K.epsilon(),
                 ) / \
-                pwm_background[:, self.x_start:self.x_end, self.y_start:self.y_end, :]
+                pwm_background[..., self.x_start:self.x_end, self.y_start:self.y_end, :]
             ) / \
             K.log(2.0)
         conservation = K.sum(conservation, axis=-1)
 
-        mask = K.max(pwm_mask[:, self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
-        n_unmasked = K.sum(mask, axis=(1, 2))
+        mask = K.max(pwm_mask[..., self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
+        n_unmasked = K.sum(mask, axis=(-2, -1))
 
-        mean_conservation = K.sum(conservation * mask, axis=(1, 2)) / n_unmasked
+        mean_conservation = K.sum(conservation * mask, axis=(-2, -1)) / n_unmasked
 
         margin_conservation = K.switch(
             mean_conservation < self.target_bits,
@@ -871,28 +926,28 @@ class EntropyLossLayer(Layer):
             K.zeros_like(mean_conservation),
         )
 
-        return margin_conservation
+        return K.mean(margin_conservation, axis=-1)
 
     def _target_entropy_sme_masked(self, pwm, pwm_mask, pwm_background):
         conservation = \
-            pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :] * \
+            pwm[..., self.x_start:self.x_end, self.y_start:self.y_end, :] * \
             K.log(
                 K.clip(
-                    pwm[:, self.x_start:self.x_end, self.y_start:self.y_end, :],
+                    pwm[..., self.x_start:self.x_end, self.y_start:self.y_end, :],
                     K.epsilon(),
                     1. - K.epsilon(),
                 ) / \
-                pwm_background[:, self.x_start:self.x_end, self.y_start:self.y_end, :]
+                pwm_background[..., self.x_start:self.x_end, self.y_start:self.y_end, :]
             ) / \
             K.log(2.0)
         conservation = K.sum(conservation, axis=-1)
 
-        mask = K.max(pwm_mask[:, self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
-        n_unmasked = K.sum(mask, axis=(1, 2))
+        mask = K.max(pwm_mask[..., self.x_start:self.x_end, self.y_start:self.y_end, :], axis=-1)
+        n_unmasked = K.sum(mask, axis=(-2, -1))
 
-        mean_conservation = K.sum(conservation * mask, axis=(1, 2)) / n_unmasked
+        mean_conservation = K.sum(conservation * mask, axis=(-2, -1)) / n_unmasked
 
-        return (mean_conservation - self.target_bits) ** 2
+        return K.mean((mean_conservation - self.target_bits) ** 2, axis=-1)
 
     def call(self, inputs, mask=None):
 
@@ -1030,8 +1085,8 @@ def initialize_backgrounds(model, background_matrices, model_prefix=''):
 class Scrambler:
 
     def __init__(self, n_inputs=1, n_classes=1, multi_input_mode='siamese', scrambler_mode='inclusion', input_size_x=1,
-                 input_size_y=100, n_out_channels=4, input_templates=None, input_backgrounds=None, batch_size=32,
-                 n_samples=32, sample_mode='st', zeropad_input=False, mask_dropout=False,
+                 input_size_y=100, n_out_channels=4, n_outputs=1, input_templates=None, input_backgrounds=None, 
+                 batch_size=32, n_samples=32, sample_mode='st', zeropad_input=False, mask_dropout=False,
                  network_config={'n_groups': 1, 'n_resblocks_per_group': 4, 'n_channels': 32, 'window_size': 8,
                                  'dilation_rates': [1], 'drop_rate': 0.25, 'norm_mode': 'instance',
                                  'mask_smoothing': True, 'mask_smoothing_window_size': 7, 'mask_smoothing_std': 1.5,
@@ -1045,6 +1100,7 @@ class Scrambler:
         self.input_size_x = input_size_x if input_size_x is not None else 1
         self.input_size_y = input_size_y
         self.n_out_channels = n_out_channels
+        self.n_outputs = n_outputs
         self.batch_size = batch_size
         self.n_samples = n_samples
         self.sample_mode = sample_mode
@@ -1087,6 +1143,7 @@ class Scrambler:
             self.input_size_y,
             scrambler_mode=self.scrambler_mode,
             n_out_channels=self.n_out_channels,
+            n_outputs=self.n_outputs,
             n_spatial_dims=1 if self.input_size_x == 1 else 2,
             n_groups=self.n_groups,
             n_resblocks_per_group=self.n_resblocks_per_group,
@@ -1109,7 +1166,8 @@ class Scrambler:
         # Load sampler
         sampler = build_sampler(self.batch_size, self.input_size_x, self.input_size_y,
                                 n_classes=len(self.input_templates), n_samples=self.n_samples,
-                                sample_mode=self.sample_mode, n_channels=self.n_out_channels)
+                                n_outputs=self.n_outputs, n_channels=self.n_out_channels,
+                                sample_mode=self.sample_mode)
 
         self.sampler = sampler
 
@@ -1155,9 +1213,9 @@ class Scrambler:
             scrambled_logit, importance_score = scrambler(scrambler_input, scrambler_drop, scrambler_label)
 
             scrambler_logit_split = Lambda(
-                lambda x: [x[:, :, k * input_size_y:(k + 1) * input_size_y, :] for k in range(self.n_inputs)])
+                lambda x: [x[:, :, :, k * input_size_y:(k + 1) * input_size_y, :] for k in range(self.n_inputs)])
             scrambler_score_split = Lambda(
-                lambda x: [x[:, :, k * input_size_y:(k + 1) * input_size_y, :] for k in range(self.n_inputs)])
+                lambda x: [x[:, :, :, k * input_size_y:(k + 1) * input_size_y, :] for k in range(self.n_inputs)])
 
             scrambled_logits = scrambler_logit_split(scrambled_logit)
             importance_scores = scrambler_score_split(importance_score)
@@ -1274,9 +1332,9 @@ class Scrambler:
             score = pred_bundle[3 * self.n_inputs + input_ix]
 
             if signal_is_1d:
-                pwms.append(pwm[:, 0, ...])
-                samples.append(sample[:, :, 0, ...])
-                scores.append(score[:, 0, ...])
+                pwms.append(pwm[:, :, 0, ...])
+                samples.append(sample[:, :, :, 0, ...])
+                scores.append(score[:, :, 0, ...])
             else:
                 pwms.append(pwm)
                 samples.append(sample)
@@ -1411,9 +1469,9 @@ class Scrambler:
             scrambled_logit, importance_score = self.scrambler(scrambler_input, scrambler_drop, scrambler_label)
 
             scrambler_logit_split = Lambda(
-                lambda x: [x[:, :, k * self.input_size_y:(k + 1) * self.input_size_y, :] for k in range(self.n_inputs)])
+                lambda x: [x[:, :, :, k * self.input_size_y:(k + 1) * self.input_size_y, :] for k in range(self.n_inputs)])
             scrambler_score_split = Lambda(
-                lambda x: [x[:, :, k * self.input_size_y:(k + 1) * self.input_size_y, :] for k in range(self.n_inputs)])
+                lambda x: [x[:, :, :, k * self.input_size_y:(k + 1) * self.input_size_y, :] for k in range(self.n_inputs)])
 
             scrambled_logits = scrambler_logit_split(scrambled_logit)
             importance_scores = scrambler_score_split(importance_score)
@@ -1437,45 +1495,82 @@ class Scrambler:
             sampled_masks.append(sampled_mask)
 
             # Define layer to deflate sample axis
-            deflate_scrambled_sample = Lambda(lambda x: K.reshape(x, (
-            self.batch_size * self.n_samples, self.input_size_x, self.input_size_y, self.n_out_channels)),
-                                              name='t_deflate_scrambled_sample_' + str(input_ix))
+            deflate_scrambled_sample = Lambda(
+                lambda x: K.reshape(
+                    x,
+                    (self.batch_size * self.n_samples * self.n_outputs, self.input_size_x, self.input_size_y, self.n_out_channels),
+                ),
+                name='t_deflate_scrambled_sample_' + str(input_ix),
+            )
 
             # Deflate sample axis
             deflated_sampled_pwm = deflate_scrambled_sample(sampled_pwm)
             deflated_sampled_pwms.append(deflated_sampled_pwm)
 
         # Make reference prediction on non-scrambled input sequence
-        switch_to_1d_non_scrambled = Lambda(lambda x, signal_is_1d=signal_is_1d: x[:, 0, ...] if signal_is_1d else x,
-                                            name='t_switch_to_1d_non_scrambled')
-        scrambler_inputs_to_pred = [switch_to_1d_non_scrambled(scrambler_input) for scrambler_input in scrambler_inputs]
+        switch_to_1d_non_scrambled = Lambda(
+            lambda x, signal_is_1d=signal_is_1d: x[:, 0, ...] if signal_is_1d else x,
+            name='t_switch_to_1d_non_scrambled',
+        )
+        scrambler_inputs_to_pred = [
+            switch_to_1d_non_scrambled(scrambler_input) for scrambler_input in scrambler_inputs
+        ]
         y_pred_non_scrambled_deflated = predictor(
             scrambler_inputs_to_pred + scrambler_extra_inputs) if reference == 'predictor' else scrambler_label
 
         # Make prediction on scrambled sequence samples
-        switch_to_1d_scrambled = Lambda(lambda x, signal_is_1d=signal_is_1d: x[:, 0, ...] if signal_is_1d else x,
-                                        name='t_switch_to_1d_scrambled')
-        deflated_sampled_pwms_to_pred = [switch_to_1d_scrambled(deflated_sampled_pwm) for deflated_sampled_pwm in
-                                         deflated_sampled_pwms]
+        switch_to_1d_scrambled = Lambda(
+            lambda x, signal_is_1d=signal_is_1d: x[:, 0, ...] if signal_is_1d else x,
+            name='t_switch_to_1d_scrambled',
+        )
+        deflated_sampled_pwms_to_pred = [
+            switch_to_1d_scrambled(deflated_sampled_pwm) for deflated_sampled_pwm in deflated_sampled_pwms
+        ]
+
         scrambler_extra_inputs_repeated = []
         for extra_in_ix, scrambler_extra_inp in enumerate(scrambler_extra_inputs):
-            repeat_scrambler_extra_input = Lambda(lambda x: K.repeat_elements(x, self.n_samples, axis=0),
-                                                  name='repeat_scrambler_extra_input_' + str(extra_in_ix))
+            repeat_scrambler_extra_input = Lambda(
+                lambda x: K.repeat_elements(x, self.n_samples * self.n_outputs, axis=0),
+                name='repeat_scrambler_extra_input_' + str(extra_in_ix))
             scrambler_extra_inputs_repeated.append(repeat_scrambler_extra_input(scrambler_extra_inp))
+
         y_pred_scrambled_deflated = predictor(deflated_sampled_pwms_to_pred + scrambler_extra_inputs_repeated)
 
         # Define layer to inflate sample axis
-        inflate_non_scrambled_prediction = Lambda(lambda x: K.tile(K.expand_dims(x, axis=1), (1, self.n_samples, 1)),
-                                                  name='t_inflate_non_scrambled_prediction')
-        inflate_scrambled_prediction = Lambda(lambda x: K.reshape(x, (self.batch_size, self.n_samples, self.n_classes)),
-                                              name='t_inflate_scrambled_prediction')
-
-        # Inflate sample axis
+        # Non-scrambled predictions have dimensions (batch_size, n_outputs, n_classes)
+        # Expand and tile to convert to (batch_size, n_samples, n_outputs, n_classes)
+        # Then reshape into (batch_size, n_samples*n_outputs, n_classes)
+        inflate_non_scrambled_prediction = Lambda(
+            lambda x: K.reshape(
+                K.tile(
+                    K.expand_dims(x, axis=1),
+                    (1, self.n_samples, 1, 1),
+                ),
+                (self.batch_size, self.n_samples * self.n_outputs, self.n_classes),
+            ), 
+            name='t_inflate_non_scrambled_prediction',
+        )
         y_pred_non_scrambled = inflate_non_scrambled_prediction(y_pred_non_scrambled_deflated)
+
+        # Scrambled predictions have dimensions (self.batch_size * self.n_samples * self.n_outputs, n_outputs, n_classes)
+        # However, for prediction with 1st dimension i, we should only preserve second dimension j = i % n_outputs
+        # We use gather_nd to select on the 2nd dimension and get (self.batch_size * self.n_samples * self.n_outputs, n_classes)
+        # Then, reshape into (self.batch_size, self.n_samples * self.n_outputs, n_classes)
+        inflate_scrambled_prediction = Lambda(
+            lambda x: K.reshape(
+                tf.gather_nd(
+                    batch_dims=1,
+                    indices=K.tile(K.expand_dims(K.arange(self.n_outputs), axis=1), (self.batch_size * self.n_samples, 1)),
+                    params=x,
+                ),
+                (self.batch_size, self.n_samples * self.n_outputs, self.n_classes),
+            ),
+            name='t_inflate_scrambled_prediction',
+        )
         y_pred_scrambled = inflate_scrambled_prediction(y_pred_scrambled_deflated)
 
         # Define background matrix embeddings
-        seq_reshape_layer = Reshape((self.input_size_x, self.input_size_y, self.n_out_channels))
+        seq_reshape_layer = Reshape((1, self.input_size_x, self.input_size_y, self.n_out_channels))
 
         x_mean_dense = Embedding(len(self.input_templates), self.input_size_x * self.input_size_y * self.n_out_channels,
                                  embeddings_initializer='zeros', name='x_mean_dense')
