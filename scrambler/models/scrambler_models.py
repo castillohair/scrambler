@@ -1669,20 +1669,22 @@ class Scrambler:
         output_dev_losses = []
         for input_ix in range(self.n_inputs):
             importance_score_pre_softplus = importance_scores_pre_softplus[input_ix]
-            output_dev_loss_layer = Lambda(
-                lambda x: K.reshape(
-                    K.mean(
-                        K.std(x, axis=1),
-                        axis=-2,
+            if output_dev_mode=='std':
+                output_dev_loss_layer = Lambda(
+                    lambda x: K.reshape(
+                        K.mean(
+                            K.std(x, axis=1),
+                            axis=-2,
+                        ),
+                        (self.batch_size, 1),
                     ),
-                    (self.batch_size, 1),
-                ),
-                name='output_dev_' + str(input_ix)
-            )
-            output_dev_loss_input = output_dev_loss_layer(importance_score_pre_softplus)
+                    name='output_dev_' + str(input_ix)
+                )
+                output_dev_loss_input = output_dev_loss_layer(importance_score_pre_softplus)
+            else:
+                raise ValueError(f'value {output_dev_mode} for output_dev_mode not recognized')
             output_dev_losses.append(output_dev_loss_input)
 
-        print(output_dev_losses)
         output_dev_loss = None
         if len(output_dev_losses) > 1:
             output_dev_loss = Lambda(lambda x: K.mean(x, axis=-1), name='output_dev')(Concatenate(axis=-1)(output_dev_losses))
