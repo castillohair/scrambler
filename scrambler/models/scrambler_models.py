@@ -444,7 +444,7 @@ def load_scrambler_network(input_size_x, input_size_y, scrambler_mode='inclusion
     smooth_conv = None
     if mask_smoothing:
         smooth_reshape_in = Lambda(
-            lambda x: K.reshape(x, (x.shape[0]*n_outputs, input_size_x, input_size_y, 1))
+            lambda x: K.reshape(x, (-1, input_size_x, input_size_y, 1))
         )
         smooth_conv = Conv2D(
             1,
@@ -457,7 +457,7 @@ def load_scrambler_network(input_size_x, input_size_y, scrambler_mode='inclusion
             name='scrambler_smooth_conv',
         )
         smooth_reshape_out = Lambda(
-            lambda x: K.reshape(x, (x.shape[0]/n_outputs, n_outputs, input_size_x, input_size_y, 1))
+            lambda x: K.reshape(x, (-1, n_outputs, input_size_x, input_size_y, 1))
         )
 
     onehot_to_logits = Lambda(lambda x: 2. * x - 1., name='scrambler_onehot_to_logits')
