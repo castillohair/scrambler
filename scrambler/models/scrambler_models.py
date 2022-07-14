@@ -507,18 +507,19 @@ def load_scrambler_network(input_size_x, input_size_y, scrambler_mode='inclusion
             skip_add_out = skip_add([skip_add_out, skip_conv_outs[group_ix]])
 
         # Final conv out
-        final_conv_out = final_softplus(final_conv_adjust_dim(final_conv(skip_add_out)))
+        importance_score_pre_softplus = final_conv_adjust_dim(final_conv(skip_add_out))
+        importance_score = final_softplus(importance_score_pre_softplus)
 
         if mask_dropout:
-            final_conv_out = mask_multiply([final_conv_out, mask_dropped])
+            importance_score = mask_multiply([importance_score, mask_dropped])
 
         if mask_smoothing:
-            final_conv_out = smooth_reshape_out(smooth_conv(smooth_reshape_in(final_conv_out)))
+            importance_score = smooth_reshape_out(smooth_conv(smooth_reshape_in(importance_score)))
 
         # Scale input logits by importance scores
-        scaled_logits = scale_logits([final_conv_out, onehot_to_logits(example_input)])
+        scaled_logits = scale_logits([importance_score, onehot_to_logits(example_input)])
 
-        return scaled_logits, final_conv_out
+        return scaled_logits, importance_score, importance_score_pre_softplus
 
     return _scrambler_func
 
@@ -986,6 +987,7 @@ class ScramblerMonitor(Callback):
         self.epoch_history = []
         self.nll_loss_history = []
         self.entropy_loss_history = []
+        self.output_dev_loss_history = []
 
         self.scores_history = []
         self.pwm_history = []
@@ -997,7 +999,7 @@ class ScramblerMonitor(Callback):
         if self.batch_freq_dict is not None and 0 in self.batch_freq_dict:
             self.batch_freq = self.batch_freq_dict[0]
 
-        nll_loss, entropy_loss, scores, pwms = self._predict_vals()
+        nll_loss, entropy_loss, output_dev_loss, scores, pwms = self._predict_vals()
 
         # Track metrics
         self.batch_history.append(self.n_batches)
@@ -1006,11 +1008,16 @@ class ScramblerMonitor(Callback):
         self.pwm_history.append(pwms)
         self.nll_loss_history.append(nll_loss)
         self.entropy_loss_history.append(entropy_loss)
+        self.output_dev_loss_history.append(output_dev_loss)
 
     def _predict_vals(self):
 
-        nll_loss, entropy_loss = self.loss_model.predict(x=self.loss_tensors, batch_size=self.batch_size)
-        pred_bundle = self.scrambler_model.predict(x=self.input_tensors, batch_size=self.batch_size)
+        nll_loss, entropy_loss, output_dev_loss = self.loss_model.predict(
+            x=self.loss_tensors, batch_size=self.batch_size,
+        )
+        pred_bundle = self.scrambler_model.predict(
+            x=self.input_tensors, batch_size=self.batch_size,
+        )
 
         pwms = []
         scores = []
@@ -1021,7 +1028,7 @@ class ScramblerMonitor(Callback):
             pwms.append(pwm)
             scores.append(score)
 
-        return nll_loss, entropy_loss, scores, pwms
+        return nll_loss, entropy_loss, output_dev_loss, scores, pwms
 
     def on_batch_end(self, batch, logs={}):
         self.n_batches += 1
@@ -1032,7 +1039,7 @@ class ScramblerMonitor(Callback):
             self.batch_freq = self.batch_freq_dict[self.n_batches]
 
         if self.track_mode == 'batch' and batch % self.batch_freq == 0:
-            nll_loss, entropy_loss, scores, pwms = self._predict_vals()
+            nll_loss, entropy_loss, output_dev_loss, scores, pwms = self._predict_vals()
 
             # Track metrics
             self.batch_history.append(self.n_batches)
@@ -1041,12 +1048,13 @@ class ScramblerMonitor(Callback):
             self.pwm_history.append(pwms)
             self.nll_loss_history.append(nll_loss)
             self.entropy_loss_history.append(entropy_loss)
+            self.output_dev_loss_history.append(output_dev_loss)
 
     def on_epoch_end(self, epoch, logs={}):
         self.n_epochs += 1
 
         if self.track_mode == 'epoch':
-            nll_loss, entropy_loss, scores, pwms = self._predict_vals()
+            nll_loss, entropy_loss, output_dev_loss, scores, pwms = self._predict_vals()
 
             # Track metrics
             self.epoch_history.append(self.n_epochs)
@@ -1054,6 +1062,7 @@ class ScramblerMonitor(Callback):
             self.pwm_history.append(pwms)
             self.nll_loss_history.append(nll_loss)
             self.entropy_loss_history.append(entropy_loss)
+            self.output_dev_loss_history.append(output_dev_loss)
 
 
 class LossHistory(tf.keras.callbacks.Callback):
@@ -1197,8 +1206,8 @@ class Scrambler:
         if self.multi_input_mode == 'siamese' or self.n_inputs == 1:
 
             for input_ix in range(self.n_inputs):
-                scrambled_logit, importance_score = scrambler(scrambler_inputs[input_ix], scrambler_drops[input_ix],
-                                                              scrambler_label)
+                scrambled_logit, importance_score, importance_score_pre_softplus = scrambler(
+                    scrambler_inputs[input_ix], scrambler_drops[input_ix], scrambler_label)
 
                 scrambled_logits.append(scrambled_logit)
                 importance_scores.append(importance_score)
@@ -1210,7 +1219,8 @@ class Scrambler:
             scrambler_input = scrambler_input_concat(scrambler_inputs)
             scrambler_drop = scrambler_input_concat(scrambler_drops) if self.mask_dropout else None
 
-            scrambled_logit, importance_score = scrambler(scrambler_input, scrambler_drop, scrambler_label)
+            scrambled_logit, importance_score, importance_score_pre_softplus = scrambler(
+                scrambler_input, scrambler_drop, scrambler_label)
 
             scrambler_logit_split = Lambda(
                 lambda x: [x[:, :, :, k * input_size_y:(k + 1) * input_size_y, :] for k in range(self.n_inputs)])
@@ -1350,7 +1360,8 @@ class Scrambler:
               monitor_batch_freq_dict={0: 1, 1: 5, 5: 10}, adam_lr=0.0001, adam_beta_1=0.5, adam_beta_2=0.9,
               nll_mode='reconstruction', predictor_task='classification', custom_loss_func=None, reference='predictor',
               entropy_mode='target', entropy_bits=0., entropy_weight=1.,
-              entropy_moving_bits_mode=None, entropy_bits_start=2., entropy_bits_end=0.125, entropy_bits_rate=0.01):
+              entropy_moving_bits_mode=None, entropy_bits_start=2., entropy_bits_end=0.125, entropy_bits_rate=0.01,
+              output_dev_mode='std', output_dev_weight=1.):
 
         if not isinstance(x_train, list):
             x_train = [x_train]
@@ -1447,17 +1458,19 @@ class Scrambler:
 
         scrambled_logits = []
         importance_scores = []
+        importance_scores_pre_softplus = []
         pwm_logits = []
         pwms = []
         sampled_pwms = []
         if self.multi_input_mode == 'siamese' or self.n_inputs == 1:
 
             for input_ix in range(self.n_inputs):
-                scrambled_logit, importance_score = self.scrambler(scrambler_inputs[input_ix],
-                                                                   scrambler_drops[input_ix], scrambler_label)
+                scrambled_logit, importance_score, importance_score_pre_softplus = self.scrambler(
+                    scrambler_inputs[input_ix], scrambler_drops[input_ix], scrambler_label)
 
                 scrambled_logits.append(scrambled_logit)
                 importance_scores.append(importance_score)
+                importance_scores_pre_softplus.append(importance_score_pre_softplus)
         else:
 
             scrambler_input_concat = Lambda(lambda x: K.concatenate(x, axis=2))
@@ -1466,7 +1479,8 @@ class Scrambler:
             scrambler_input = scrambler_input_concat(scrambler_inputs)
             scrambler_drop = scrambler_input_concat(scrambler_drops) if self.mask_dropout else None
 
-            scrambled_logit, importance_score = self.scrambler(scrambler_input, scrambler_drop, scrambler_label)
+            scrambled_logit, importance_score, importance_score_pre_softplus = self.scrambler(
+                scrambler_input, scrambler_drop, scrambler_label)
 
             scrambler_logit_split = Lambda(
                 lambda x: [x[:, :, :, k * self.input_size_y:(k + 1) * self.input_size_y, :] for k in range(self.n_inputs)])
@@ -1475,6 +1489,7 @@ class Scrambler:
 
             scrambled_logits = scrambler_logit_split(scrambled_logit)
             importance_scores = scrambler_score_split(importance_score)
+            importance_scores_pre_softplus = scrambler_score_split(importance_score_pre_softplus)
 
         deflated_sampled_pwms = []
         pwm_masks = []
@@ -1648,10 +1663,36 @@ class Scrambler:
         else:
             entropy_loss = Lambda(lambda x: K.mean(x[0], axis=-1), name='entropy')(entropy_losses)
 
+        # Execute output deviation loss
+        # This measures the deviation in importance scores across the model output axis,
+        # averaged across the length of the sequence
+        output_dev_losses = []
+        for input_ix in range(self.n_inputs):
+            importance_score_pre_softplus = importance_scores_pre_softplus[input_ix]
+            output_dev_loss_layer = Lambda(
+                lambda x: K.reshape(
+                    K.mean(
+                        K.std(x, axis=1),
+                        axis=-2,
+                    ),
+                    (self.batch_size, 1),
+                ),
+                name='output_dev_' + str(input_ix)
+            )
+            output_dev_loss_input = output_dev_loss_layer(importance_score_pre_softplus)
+            output_dev_losses.append(output_dev_loss_input)
+
+        print(output_dev_losses)
+        output_dev_loss = None
+        if len(output_dev_losses) > 1:
+            output_dev_loss = Lambda(lambda x: K.mean(x, axis=-1), name='output_dev')(Concatenate(axis=-1)(output_dev_losses))
+        else:
+            output_dev_loss = Lambda(lambda x: K.mean(x[0], axis=-1), name='output_dev')(output_dev_losses)
+
         loss_model = Model(
             scrambler_classes + scrambler_inputs + (scrambler_drops if scrambler_drops[0] is not None else []) + (
                 [scrambler_label] if scrambler_label is not None else []) + scrambler_extra_inputs,
-            [nll_loss, entropy_loss]
+            [nll_loss, entropy_loss, output_dev_loss]
         )
 
         # Initialize Templates and Masks
@@ -1664,7 +1705,8 @@ class Scrambler:
             optimizer=tf.keras.optimizers.Adam(lr=adam_lr, beta_1=adam_beta_1, beta_2=adam_beta_2),
             loss={
                 'nll': get_weighted_loss(loss_coeff=1.0),
-                'entropy': get_weighted_loss(loss_coeff=entropy_weight)
+                'entropy': get_weighted_loss(loss_coeff=entropy_weight),
+                'output_dev': get_weighted_loss(loss_coeff=output_dev_weight),
             }
         )
 
@@ -1707,13 +1749,13 @@ class Scrambler:
 
         train_history = loss_model.fit(
             group_train + x_train + drop_train + label_train + extra_input_train,
-            [dummy_train, dummy_train],
+            [dummy_train, dummy_train, dummy_train],
             shuffle=True,
             epochs=n_epochs,
             batch_size=self.batch_size,
             validation_data=(
                 group_test + x_test + drop_test + label_test + extra_input_test,
-                [dummy_test, dummy_test]
+                [dummy_test, dummy_test, dummy_test]
             ),
             callbacks=callbacks
         )
@@ -1727,6 +1769,7 @@ class Scrambler:
             train_history['monitor_pwms'] = monitor.pwm_history
             train_history['monitor_nll_losses'] = monitor.nll_loss_history
             train_history['monitor_entropy_losses'] = monitor.entropy_loss_history
+            train_history['monitor_output_dev_losses'] = monitor.output_dev_loss_history
 
         return train_history
 
